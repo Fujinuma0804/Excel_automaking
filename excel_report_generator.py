@@ -12,6 +12,7 @@ from datetime import datetime
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 import traceback
+from openpyxl.styles import Border, Side, Alignment
 
 
 class ExcelReportGenerator:
@@ -20,11 +21,13 @@ class ExcelReportGenerator:
         self.data_sheet = None
         self.point_sheet = None
         self.template_sheet = None
+        self.original_file_path = None  # 元のファイルパスを保存
         
     def load_workbook(self, file_path):
         """Excelファイルを読み込む"""
         try:
             self.wb = load_workbook(file_path, keep_vba=True)
+            self.original_file_path = file_path  # 元のファイルパスを保存
             return True
         except Exception as e:
             raise Exception(f"Excelファイルの読み込みに失敗しました: {str(e)}")
@@ -63,7 +66,7 @@ class ExcelReportGenerator:
         return 17  # Q列は17列目
     
     def read_point_data(self):
-        """配点シートから配点データを読み込む"""
+        """配点シートから配点データを読み込む＋分類・設問・総数取得"""
         # 配点シートの構造:
         # B列: セクション名
         # C列: 設問文
@@ -71,110 +74,125 @@ class ExcelReportGenerator:
         # E列: 配点
         points = []
         sections = {}  # セクション別の情報
-        
+        section_names = []
+        problems = []
         row = 3  # ヘッダー行は2行目、データは3行目から
-        
+
         while row <= self.point_sheet.max_row:
             # 問題番号を取得（D列）
             question_num_cell = self.point_sheet.cell(row, 4)  # D列
             if question_num_cell.value is None:
                 row += 1
                 continue
-            
+
             # セクション名を取得（B列）
             section_cell = self.point_sheet.cell(row, 2)  # B列
             section_name = str(section_cell.value).strip() if section_cell.value else ""
-            
+            if section_name and section_name not in section_names:
+                section_names.append(section_name)
+
+            # 設問文を取得（C列）
+            problem_cell = self.point_sheet.cell(row, 3)  # C列
+            problem_text = str(problem_cell.value).strip() if problem_cell.value else ""
+            problems.append(problem_text)
+
             # 配点を取得（E列）
             point_cell = self.point_sheet.cell(row, 5)  # E列
             if point_cell.value is not None:
                 question_num = int(question_num_cell.value)
                 point_value = float(point_cell.value)
-                
+
                 points.append({
                     'question_num': question_num,
                     'section': section_name,
-                    'point': point_value
+                    'point': point_value,
+                    'problem': problem_text
                 })
-                
+
                 # セクション別の集計用
                 if section_name not in sections:
                     sections[section_name] = {'total_points': 0, 'questions': []}
                 sections[section_name]['total_points'] += point_value
                 sections[section_name]['questions'].append(question_num)
-            
+
             row += 1
-        
+
         # 問題番号順にソート
         points.sort(key=lambda x: x['question_num'])
-        
-        return points, sections
+
+        total_problems = len(points)
+        return points, sections, section_names, problems, total_problems
     
-    def read_student_data(self):
-        """取得データシートから受講者データを読み込む"""
+    
+    def read_student_data(self, points_data, sections_data):
+        """取得データシートから受講者データを読み込む（各問題ごとの得点を計算）"""
         # 取得データシートの構造:
         # L列（12列目）: 氏名
         # M列（13列目）: メールアドレス
         # Q列（17列目）から: 回答データ（0=不正解、1=正解）
         students = []
         answer_col = self.get_answer_column()  # Q列 = 17列目
-        
+
         # ヘッダー行は1行目、データは2行目から
         data_start_row = 2
-        
+
         for row in range(data_start_row, self.data_sheet.max_row + 1):
             # 氏名を取得（L列 = 12列目）
             name_cell = self.data_sheet.cell(row, 12)
-            # メールアドレスを取得（M列 = 13列目）
-            email_cell = self.data_sheet.cell(row, 13)
-            
             if name_cell.value is None:
                 continue
-            
+
             # 回答データを取得（Q列から）
-            # 構造: 各問題について3列使用
-            # - 設問文の列（P, S, V, Y, ...）
-            # - 点数の列（Q, T, W, Z, ...）- これが0または1の値
-            # - フィードバックの列（R, U, X, AA, ...）
-            # したがって、回答データはQ列から3列おきに取得
             answers = []
             col = answer_col  # Q列 = 17列目
-            # 最大195列まで（実際のファイルの最大列数）
             while col <= min(195, self.data_sheet.max_column):
-                answer_cell = self.data_sheet.cell(row, col)
-                
-                # 回答値を取得（0または1）
-                if answer_cell.value is None:
-                    # 空のセルが続く場合は終了
-                    if col > answer_col and answers:
-                        break
-                    # 空セルを0として扱う
-                    answers.append(0)
-                else:
+                # 回答は answer_col または answer_col+1 にある場合がある
+                answer_cell_1 = self.data_sheet.cell(row, col)
+                answer_cell_2 = self.data_sheet.cell(row, col + 1)
+
+                # どちらかに値があれば優先して取得
+                answer_value = None
+                if answer_cell_1.value is not None and str(answer_cell_1.value).strip() != '':
                     try:
-                        # 数値として解釈できるか確認
-                        answer_value = int(answer_cell.value) if answer_cell.value != '' else 0
-                        # 0または1の値のみを有効な回答として扱う
-                        if answer_value in [0, 1]:
-                            answers.append(answer_value)
-                        else:
-                            # 0または1以外の数値の場合は0として扱う
-                            answers.append(0)
+                        answer_value = int(answer_cell_1.value)
                     except (ValueError, TypeError):
-                        # 数値でない場合は0として扱う
-                        answers.append(0)
-                
-                # 次の回答列へ（3列おき）
+                        answer_value = 0
+                elif answer_cell_2.value is not None and str(answer_cell_2.value).strip() != '':
+                    try:
+                        answer_value = int(answer_cell_2.value)
+                    except (ValueError, TypeError):
+                        answer_value = 0
+                else:
+                    answer_value = 0
+
+                # 0か1のみ許容
+                if answer_value in [0, 1]:
+                    answers.append(answer_value)
+                else:
+                    answers.append(0)
+
                 col += 3
-            
-            if answers:  # 回答がある場合のみ追加
-                students.append({
-                    'name': str(name_cell.value).strip() if name_cell.value else '',
-                    'email': str(email_cell.value).strip() if email_cell.value else '',
-                    'answers': answers,
-                    'row': row
-                })
-        
+
+            # 各セクションの得点を計算
+            section_scores = {section: 0 for section in sections_data.keys()}
+            total_score = 0
+
+            for i, point_info in enumerate(points_data):
+                section_name = point_info['section']
+                point_value = point_info['point']
+                answer = answers[i] if i < len(answers) else 0
+                if answer == 1:
+                    section_scores[section_name] += point_value
+                    total_score += point_value
+
+            students.append({
+                'name': str(name_cell.value).strip(),
+                'section_scores': section_scores,
+                'total_score': total_score,
+                'answers': answers,  # ← これを追加
+                'row': row
+            })
+
         return students
     
     def calculate_scores(self, students, points_data, sections_data):
@@ -187,11 +205,22 @@ class ExcelReportGenerator:
             answers = student['answers']
             total_score = 0
             max_score = 0
-            section_scores = {}  # セクション別の得点
+            section_scores = {}  # セクション別の得点と正解数
             
             # セクション別の集計を初期化
             for section_name in sections_data.keys():
-                section_scores[section_name] = {'score': 0, 'max_score': sections_data[section_name]['total_points']}
+                section_scores[section_name] = {
+                    'score': 0,  # 配点を考慮した得点
+                    'max_score': sections_data[section_name]['total_points'],  # セクションの満点
+                    'correct_count': 0,  # 正解した問題数
+                    'total_questions': 0  # セクションの問題数
+                }
+            
+            # セクション別の問題数をカウント
+            for point_info in points_data:
+                section_name = point_info['section']
+                if section_name in section_scores:
+                    section_scores[section_name]['total_questions'] += 1
             
             # 配点データと回答を照合
             question_scores = []
@@ -204,6 +233,7 @@ class ExcelReportGenerator:
                 max_score += point_value
                 
                 # 回答を取得（問題番号は1から始まるので、インデックスはquestion_num-1）
+                # 回答データはQ列から3列おきに取得されているため、問題番号順に対応
                 if question_num - 1 < len(answers):
                     answer = answers[question_num - 1]
                 else:
@@ -212,6 +242,7 @@ class ExcelReportGenerator:
                 if answer == 1:  # 正解
                     total_score += point_value
                     section_scores[section_name]['score'] += point_value
+                    section_scores[section_name]['correct_count'] += 1
                     question_scores.append({
                         'question_num': question_num,
                         'section': section_name,
@@ -245,13 +276,13 @@ class ExcelReportGenerator:
             
             results.append({
                 'name': student['name'],
-                'email': student['email'],
                 'total_score': total_score,
                 'max_score': max_score,
                 'percentage': percentage,
                 'rating': rating,
                 'section_scores': section_scores,
-                'question_scores': question_scores
+                'question_scores': question_scores,
+                'answers': answers
             })
         
         return results
@@ -328,77 +359,194 @@ class ExcelReportGenerator:
         
         return new_sheet
     
-    def create_summary_sheet(self, results, sections_data):
-        """集計シートを作成（総合得点、5点評価）"""
-        # 総合得点シートを作成/更新
+    def create_summary_sheet(self, results, sections_data, points_data):
+        """集計シートを作成（分類別得点を正確に集計）"""
         summary_name = "総合得点"
         if summary_name in self.wb.sheetnames:
             self.wb.remove(self.wb[summary_name])
-        
         summary_sheet = self.wb.create_sheet(summary_name)
-        
+
         # ヘッダー行
         headers = ['氏名'] + list(sections_data.keys()) + ['総合得点（満点）']
+        header_colors = [
+            "B7DEE8", "DCE6F1", "FDE9D9", "EAF1DD", "E4DFEC", "FDE9D9", "F8CBAD",
+        ]
         for col, header in enumerate(headers, 1):
             cell = summary_sheet.cell(2, col)
             cell.value = header
             cell.font = openpyxl.styles.Font(bold=True)
-        
-        # データ
+            if col-1 < len(header_colors):
+                fill = openpyxl.styles.PatternFill(
+                    fill_type="solid", fgColor=header_colors[col-1]
+                )
+                cell.fill = fill
+
+        section_question_map = {section: [] for section in sections_data.keys()}
+        for pt in points_data:
+            section_question_map[pt['section']].append(pt['question_num'])
+
+        thin_border = Border(
+            left=Side(style='thin'),
+            right=Side(style='thin'),
+            top=Side(style='thin'),
+            bottom=Side(style='thin')
+        )
+
+        # データ行
         for row_idx, result in enumerate(results, 3):
             summary_sheet.cell(row_idx, 1).value = result['name']
+            summary_sheet.cell(row_idx, 1).border = thin_border
+            total_score = 0
             col_idx = 2
             for section_name in sections_data.keys():
-                section_score = result['section_scores'].get(section_name, {'score': 0})
-                summary_sheet.cell(row_idx, col_idx).value = section_score['score']
+                question_nums = section_question_map[section_name]
+                section_score = 0
+                for qn in question_nums:
+                    if qn - 1 < len(result['answers']):
+                        answer = result['answers'][qn - 1]
+                        if answer == 1:
+                            for pt in points_data:
+                                if pt['question_num'] == qn:
+                                    section_score += pt['point']
+                                    break
+                cell = summary_sheet.cell(row_idx, col_idx)
+                cell.value = section_score
+                cell.border = thin_border
+                total_score += section_score
                 col_idx += 1
-            summary_sheet.cell(row_idx, col_idx).value = f"{result['total_score']}（{result['max_score']}点満点）"
-        
-        # 列幅を調整
+            max_score = sum([pt['point'] for pt in points_data])
+            total_cell = summary_sheet.cell(row_idx, col_idx)
+            total_cell.value = int(total_score)
+            total_cell.border = thin_border
+            total_cell.alignment = Alignment(horizontal='right')
+
+        # 平均行の追加
+        avg_row_idx = len(results) + 3
+        summary_sheet.cell(avg_row_idx, 1).value = "平均"
+        summary_sheet.cell(avg_row_idx, 1).font = openpyxl.styles.Font(bold=True)
+        summary_sheet.cell(avg_row_idx, 1).border = thin_border
+
+        for col in range(2, len(headers) + 1):
+            col_letter = get_column_letter(col)
+            # 3行目からデータが始まる
+            formula = f"=AVERAGE({col_letter}3:{col_letter}{avg_row_idx-1})"
+            cell = summary_sheet.cell(avg_row_idx, col)
+            cell.value = formula
+            cell.border = thin_border
+            cell.font = openpyxl.styles.Font(bold=True)
+            cell.alignment = Alignment(horizontal='right')
+            cell.number_format = '0.00'
+
+        # ヘッダー行にも枠線を追加
         for col in range(1, len(headers) + 1):
+            cell = summary_sheet.cell(2, col)
+            cell.border = thin_border
             summary_sheet.column_dimensions[get_column_letter(col)].width = 20
-        
-        # 5点評価シートを作成/更新
+    
+    def create_rating_sheet(self, results, sections_data):
+        """5点評価シートを作成（各セクションごとに5点評価を表示・集計）"""
         rating_name = "5点評価"
         if rating_name in self.wb.sheetnames:
             self.wb.remove(self.wb[rating_name])
-        
         rating_sheet = self.wb.create_sheet(rating_name)
-        
+
         # ヘッダー行
-        rating_headers = ['氏名'] + list(sections_data.keys()) + ['総合得点']
-        for col, header in enumerate(rating_headers, 1):
+        headers = ['氏名'] + list(sections_data.keys()) + ['総合評価（5点満点）']
+        header_colors = [
+            "B7DEE8", "DCE6F1", "FDE9D9", "EAF1DD", "E4DFEC", "FDE9D9", "F8CBAD",
+        ]
+        thin_border = Border(
+            left=Side(style='thin'),
+            right=Side(style='thin'),
+            top=Side(style='thin'),
+            bottom=Side(style='thin')
+        )
+
+        for col, header in enumerate(headers, 1):
             cell = rating_sheet.cell(2, col)
             cell.value = header
             cell.font = openpyxl.styles.Font(bold=True)
-        
-        # データ（5点評価を計算）
+            cell.border = thin_border
+            if col-1 < len(header_colors):
+                fill = openpyxl.styles.PatternFill(
+                    fill_type="solid", fgColor=header_colors[col-1]
+                )
+                cell.fill = fill
+            rating_sheet.column_dimensions[get_column_letter(col)].width = 20
+
+        # データ行
         for row_idx, result in enumerate(results, 3):
             rating_sheet.cell(row_idx, 1).value = result['name']
+            rating_sheet.cell(row_idx, 1).border = thin_border
+            total_rating = 0
             col_idx = 2
             for section_name in sections_data.keys():
+                # 5点評価を取得
                 section_score = result['section_scores'].get(section_name, {'score': 0, 'max_score': 1})
                 if section_score['max_score'] > 0:
-                    section_percentage = (section_score['score'] / section_score['max_score']) * 100
-                    if section_percentage >= 90:
-                        section_rating = 5
-                    elif section_percentage >= 80:
-                        section_rating = 4
-                    elif section_percentage >= 70:
-                        section_rating = 3
-                    elif section_percentage >= 60:
-                        section_rating = 2
-                    else:
-                        section_rating = 1
+                    section_value = (section_score['score'] / section_score['max_score']) * 5                    
                 else:
-                    section_rating = 0
-                rating_sheet.cell(row_idx, col_idx).value = section_rating
+                    section_value = 0
+                cell = rating_sheet.cell(row_idx, col_idx)
+                cell.value = section_value
+                cell.border = thin_border
+                cell.alignment = Alignment(horizontal='right')
+                cell.number_format = '0.00'
+                total_rating += section_value
                 col_idx += 1
-            rating_sheet.cell(row_idx, col_idx).value = result['rating']
+            # 総合評価（5点満点）の平均
+            avg_rating = round(total_rating / len(sections_data), 2) if len(sections_data) > 0 else 0
+            total_cell = rating_sheet.cell(row_idx, col_idx)
+            total_cell.value = avg_rating
+            total_cell.border = thin_border
+            total_cell.number_format = '0.00'
+            total_cell.alignment = Alignment(horizontal='right')
+
+        # 平均行の追加
+        avg_row_idx = len(results) + 3
+        rating_sheet.cell(avg_row_idx, 1).value = "平均"
+        rating_sheet.cell(avg_row_idx, 1).font = openpyxl.styles.Font(bold=True)
+        rating_sheet.cell(avg_row_idx, 1).border = thin_border
+
+        for col in range(2, len(headers) + 1):
+            col_letter = get_column_letter(col)
+            formula = f"=AVERAGE({col_letter}3:{col_letter}{avg_row_idx-1})"
+            cell = rating_sheet.cell(avg_row_idx, col)
+            cell.value = formula
+            cell.border = thin_border
+            cell.font = openpyxl.styles.Font(bold=True)
+            cell.alignment = Alignment(horizontal='right')
+            cell.number_format = '0.00'
+    
+    def update_data_sheet(self, students, results, sections_data):
+        """取得データシートに各問題類型のスコア列を追加"""
+        # 学生の行番号と結果を対応付ける辞書を作成
+        student_row_to_result = {}
+        for student, result in zip(students, results):
+            student_row_to_result[student['row']] = result
         
-        # 列幅を調整
-        for col in range(1, len(rating_headers) + 1):
-            rating_sheet.column_dimensions[get_column_letter(col)].width = 15
+        # 最後の列を取得
+        last_col = self.data_sheet.max_column
+        start_col = last_col + 2  # 1列空けてから追加
+        
+        # ヘッダー行（1行目）に各問題類型の名前を追加
+        header_row = 1
+        section_names = list(sections_data.keys())
+        for col_idx, section_name in enumerate(section_names):
+            col = start_col + col_idx
+            cell = self.data_sheet.cell(header_row, col)
+            cell.value = section_name
+            cell.font = openpyxl.styles.Font(bold=True)
+        
+        # 各学生の行にスコアを追加
+        for row_num in range(2, self.data_sheet.max_row + 1):
+            if row_num in student_row_to_result:
+                result = student_row_to_result[row_num]
+                for col_idx, section_name in enumerate(section_names):
+                    col = start_col + col_idx
+                    section_score = result['section_scores'].get(section_name, {'score': 0})
+                    cell = self.data_sheet.cell(row_num, col)
+                    cell.value = section_score['score']
     
     def generate_reports(self, output_path=None):
         """レポートを生成"""
@@ -407,8 +555,8 @@ class ExcelReportGenerator:
             self.find_sheets()
             
             # データを読み込む
-            points_data, sections_data = self.read_point_data()
-            students = self.read_student_data()
+            points_data, sections_data, section_names, problems, total_problems = self.read_point_data()
+            students = self.read_student_data(points_data, sections_data)
             
             if not students:
                 raise Exception("受講者データが見つかりません")
@@ -419,8 +567,14 @@ class ExcelReportGenerator:
             # 得点を計算
             results = self.calculate_scores(students, points_data, sections_data)
             
+            # 取得データシートに各問題類型のスコア列を追加
+            self.update_data_sheet(students, results, sections_data)
+            
             # 集計シートを作成
-            self.create_summary_sheet(results, sections_data)
+            self.create_summary_sheet(results, sections_data, points_data)
+            
+            # 5点評価シートを作成
+            self.create_rating_sheet(results, sections_data)
             
             # 個別レポートシートを作成
             template_sheet_name = self.template_sheet.title
@@ -429,16 +583,48 @@ class ExcelReportGenerator:
             
             # ファイルを保存
             if output_path:
-                self.wb.save(output_path)
+                # 出力パスが指定されている場合
+                base_output_path = Path(output_path)
             else:
                 # 元のファイル名に「_出力」を追加
-                original_path = self.wb.path if hasattr(self.wb, 'path') else None
-                if original_path:
-                    base_path = Path(original_path)
-                    output_path = base_path.parent / f"{base_path.stem}_出力{base_path.suffix}"
-                    self.wb.save(output_path)
+                if self.original_file_path:
+                    base_path = Path(self.original_file_path)
+                    base_output_path = base_path.parent / f"{base_path.stem}_出力{base_path.suffix}"
+                else:
+                    raise Exception("元のファイルパスが設定されていません")
             
-            return results, str(output_path)
+            # 既存のファイルが存在し、開かれている場合はタイムスタンプを追加
+            output_path_obj = base_output_path
+            if output_path_obj.exists():
+                try:
+                    # 削除を試みる（開かれていない場合）
+                    output_path_obj.unlink()
+                    output_path_str = str(output_path_obj)
+                except (PermissionError, OSError):
+                    # ファイルが開かれている場合はタイムスタンプを追加
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                    base_name = output_path_obj.stem
+                    suffix = output_path_obj.suffix
+                    output_path_str = str(output_path_obj.parent / f"{base_name}_{timestamp}{suffix}")
+            else:
+                # ファイルが存在しない場合はそのまま使用
+                output_path_str = str(output_path_obj)
+            
+            # ファイルを保存
+            try:
+                self.wb.save(output_path_str)
+            except PermissionError:
+                raise Exception(
+                    f"ファイルの保存に失敗しました。\n"
+                    f"以下の可能性があります：\n"
+                    f"1. 出力ファイルが既にExcelで開かれている\n"
+                    f"2. ファイルのアクセス権限がない\n"
+                    f"3. ディレクトリへの書き込み権限がない\n\n"
+                    f"ファイル: {Path(output_path_str).name}\n"
+                    f"パス: {Path(output_path_str).parent}"
+                )
+            
+            return results, output_path_str
             
         except Exception as e:
             raise Exception(f"レポート生成中にエラーが発生しました: {str(e)}\n{traceback.format_exc()}")
@@ -514,7 +700,7 @@ class ReportGeneratorUI:
             filetypes=[("Excel files", "*.xlsx *.xlsm"), ("All files", "*.*")]
         )
         
-        if file_path:
+        if (file_path):
             self.file_path = file_path
             self.file_label.config(text=os.path.basename(file_path), foreground="black")
             self.execute_button.config(state=tk.NORMAL)
