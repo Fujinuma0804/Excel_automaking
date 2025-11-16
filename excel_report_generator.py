@@ -1,18 +1,20 @@
 """
 Excel集計レポート生成ツール
-「取得データ」「配点」「aaa（ひな型）」シートから受講者ごとの集計レポートを生成
+「取得データ」「配点」「Template」シートから受講者ごとの集計レポートを生成
 """
 
 import openpyxl
 from openpyxl import load_workbook
 from openpyxl.utils import get_column_letter
+from openpyxl.chart import RadarChart, Reference, Series
 import os
 from pathlib import Path
 from datetime import datetime
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 import traceback
-from openpyxl.styles import Border, Side, Alignment
+from openpyxl.styles import Border, Side, Alignment, Font, PatternFill, NamedStyle
+from openpyxl.formatting.rule import CellIsRule, FormulaRule
 
 
 class ExcelReportGenerator:
@@ -48,9 +50,9 @@ class ExcelReportGenerator:
                 self.point_sheet = self.wb[name]
                 break
         
-        # 「aaa（ひな型）」シートを検索
+        # 「Template」シートを検索
         for name in sheet_names:
-            if 'aaa' in name.lower() or 'ひな型' in name or '雛型' in name:
+            if 'template' in name.lower() or 'ひな型' in name or '雛型' in name:
                 self.template_sheet = self.wb[name]
                 break
         
@@ -59,7 +61,7 @@ class ExcelReportGenerator:
         if not self.point_sheet:
             raise Exception("「配点」シートが見つかりません")
         if not self.template_sheet:
-            raise Exception("「aaa（ひな型）」シートが見つかりません")
+            raise Exception("「Template」シートが見つかりません")
     
     def get_answer_column(self):
         """回答列（Q列）を取得"""
@@ -287,41 +289,109 @@ class ExcelReportGenerator:
         
         return results
     
-    def create_report_sheet(self, result, template_sheet_name, student_row_index):
-        """個別レポートシートを作成"""
-        # テンプレートシートをコピー
-        template = self.wb[template_sheet_name]
-        new_sheet_name = f"{result['name']}_レポート"
-        # シート名が長すぎる場合は短縮
-        if len(new_sheet_name) > 31:
-            new_sheet_name = new_sheet_name[:28] + "..."
+    def calculate_company_averages(self, results, sections_data):
+        """全受講者の平均値を計算（5点評価）"""
+        company_avg = {}
+        section_names = list(sections_data.keys())
         
-        # 既存のシートがある場合は削除
+        for section_name in section_names:
+            total_rating = 0
+            count = 0
+            for result in results:
+                section_score = result['section_scores'].get(section_name, {'score': 0, 'max_score': 1})
+                if section_score['max_score'] > 0:
+                    rating = (section_score['score'] / section_score['max_score']) * 5
+                    total_rating += rating
+                    count += 1
+            company_avg[section_name] = round(total_rating / count, 2) if count > 0 else 0
+        
+        return company_avg
+    
+    def create_radar_chart(self, sheet, section_names, data_start_row=27, chart_position="B8"):
+        """テーブルデータからレーダーチャートを作成"""
+        try:
+            # レーダーチャートを作成
+            chart = RadarChart()
+            chart.type = "standard"  # RadarChartのタイプ: 'standard', 'filled', 'marker'のいずれか
+            chart.style = 26
+            
+            # Y軸のスケール設定（0-5の範囲）
+            if hasattr(chart, 'y_axis') and hasattr(chart.y_axis, 'scaling'):
+                chart.y_axis.scaling.min = 0
+                chart.y_axis.scaling.max = 5
+            
+            # カテゴリ（ラベル）の参照 - B列のセクション名（行27-31）
+            categories = Reference(sheet, min_col=2, min_row=data_start_row, max_row=data_start_row + len(section_names) - 1)
+            
+            # 社内平均のデータ系列 - C列（行27-31）
+            avg_data = Reference(sheet, min_col=3, min_row=data_start_row, max_row=data_start_row + len(section_names) - 1)
+            avg_series = Series(avg_data, title="社内平均")
+            chart.series.append(avg_series)
+            
+            # 今回の得点のデータ系列 - D列（行27-31）
+            current_data = Reference(sheet, min_col=4, min_row=data_start_row, max_row=data_start_row + len(section_names) - 1)
+            current_series = Series(current_data, title="今回の得点")
+            chart.series.append(current_series)
+            
+            # カテゴリを設定
+            chart.set_categories(categories)
+            
+            # チャートをシートに追加（B8セル付近に配置）
+            sheet.add_chart(chart, chart_position)
+            
+        except Exception as e:
+            # チャート作成に失敗しても処理を続行
+            print(f"チャート作成エラー: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            pass
+    
+    def create_report_sheet(self, result, template_sheet_name, student_row_index, all_results=None, sections_data=None):
+        """
+        個別レポートシートを作成（テンプレートをそのままコピーし、氏名と得点のみ埋める）
+        グラフや星などテンプレートの内容はそのまま残す
+        """
+        template = self.wb[template_sheet_name]
+        # シート名を学生の名前に設定（Excelのシート名は31文字まで）
+        new_sheet_name = result['name']
+        if len(new_sheet_name) > 31:
+            new_sheet_name = new_sheet_name[:31]
+        # 既存のシートがあれば削除
         if new_sheet_name in self.wb.sheetnames:
             self.wb.remove(self.wb[new_sheet_name])
-        
+        # テンプレートシートをコピー（チャートや星レビューも含む）
+        # copy_worksheet はチャート、図形、VBAマクロ、条件付き書式などを含むすべての要素をコピーします
         new_sheet = self.wb.copy_worksheet(template)
         new_sheet.title = new_sheet_name
         
-        # テンプレートシートの構造に基づいてデータを埋め込む
-        # A2セル: 受講者名
+        # 重要: 星レビューの視覚的表示には、テンプレートシートに以下の設定が必要です：
+        # 1. セルF4:J4を選択
+        # 2. 「ホーム」タブ → 「条件付き書式」 → 「アイコンセット」 → 「5つ星の評価」を選択
+        # 3. または、カスタム数値書式で星記号（★）を使用
+        # これらの書式は copy_worksheet により自動的にコピーされます
+
+        # 氏名をA2セルに記入
         try:
             new_sheet['A2'] = result['name']
-        except:
+        except Exception:
             pass
+
         
-        # D27-D31セル: 各セクションの5点評価
-        # テンプレートでは数式で「5点評価」シートから取得しているが、
-        # 個別レポートでは直接値を設定するか、数式を更新する
-        # ここでは直接値を設定する方法を採用
+
+        # スキルカテゴリごとの得点（D27～D31）を埋める
         section_names = list(result['section_scores'].keys())
         section_row_mapping = {
-            0: 27,  # 1番目のセクション -> D27
-            1: 28,  # 2番目のセクション -> D28
-            2: 29,  # 3番目のセクション -> D29
-            3: 30,  # 4番目のセクション -> D30
-            4: 31,  # 5番目のセクション -> D31
+            0: 27,
+            1: 28,
+            2: 29,
+            3: 30,
+            4: 31,
         }
+        
+        # 社内平均を計算（全受講者の平均値）
+        company_avg = {}
+        if all_results and sections_data:
+            company_avg = self.calculate_company_averages(all_results, sections_data)
         
         for idx, section_name in enumerate(section_names):
             if idx in section_row_mapping:
@@ -329,34 +399,104 @@ class ExcelReportGenerator:
                 # セクション名をB列に設定
                 try:
                     new_sheet.cell(row, 2).value = section_name
-                except:
+                except Exception:
                     pass
+                
+                # 社内平均をC列に設定
+                if section_name in company_avg:
+                    try:
+                        new_sheet.cell(row, 3).value = company_avg[section_name]
+                    except Exception:
+                        pass
                 
                 # 5点評価を計算してD列に設定
                 section_score = result['section_scores'].get(section_name, {'score': 0, 'max_score': 1})
+
                 if section_score['max_score'] > 0:
-                    section_percentage = (section_score['score'] / section_score['max_score']) * 100
-                    if section_percentage >= 90:
-                        section_rating = 5
-                    elif section_percentage >= 80:
-                        section_rating = 4
-                    elif section_percentage >= 70:
-                        section_rating = 3
-                    elif section_percentage >= 60:
-                        section_rating = 2
-                    else:
-                        section_rating = 1
+                    section_value = round((section_score['score'] / section_score['max_score']) * 5, 2)
                 else:
-                    section_rating = 0
-                
+                    section_value = 0
                 try:
-                    new_sheet.cell(row, 4).value = section_rating
-                except:
+                    new_sheet.cell(row, 4).value = section_value
+                except Exception:
                     pass
-        
-        # 総合点（E4セル）は数式で自動計算されるが、念のため確認
-        # テンプレートの数式が正しく動作することを前提とする
-        
+
+        # 総合点（E4セル）を埋める（例: 5点評価の平均値）
+        try:
+            avg_rating = round(
+                sum(
+                    round((section['score'] / section['max_score']) * 5, 2)
+                    if section['max_score'] > 0 else 0
+                    for section in result['section_scores'].values()
+                ) / len(result['section_scores']), 2
+            ) if len(result['section_scores']) > 0 else 0
+            new_sheet['E4'] = avg_rating
+            
+            # 星レビュー用の数式を設定（F4～J4）
+            # E4の値に基づいて、各星セルに★（満点）、半分の星（左半分が塗りつぶし）、または☆（空）を表示
+            # 5.0 = ★★★★★, 4.0-4.9 = ★★★★◐ (4 full + 1 half), 3.0-3.9 = ★★★◐☆, etc.
+            # 半分の星は左半分が塗りつぶされた星を表現（視覚的に半分に見えるように）
+            try:
+                # 星の表示ロジック：
+                # - 整数部分の星は★（満点、塗りつぶし）
+                # - 小数部分がある場合、次の星を半分として表示（左半分塗りつぶしの星）
+                # - 半分の星はUnicodeの左半分円（◐）または視覚的に半分に見える文字を使用
+                
+                # F4: 1つ目の星（E4>=1なら★、それ以外は☆）
+                new_sheet['F4'] = '=IF(E4>=1,"★","☆")'
+                
+                # G4: 2つ目の星（E4>=2なら★、E4>=1かつE4<2なら半分★、それ以外は☆）
+                # 半分の星には左半分が塗りつぶされた円（◐）または視覚的に半分に見える文字を使用
+                # 実際には、条件付き書式で半分の星を表示する方が良いが、数式でも可能
+                new_sheet['G4'] = '=IF(E4>=2,"★",IF(AND(E4>=1,E4<2),"◐","☆"))'
+                
+                # H4: 3つ目の星（E4>=3なら★、E4>=2かつE4<3なら半分★、それ以外は☆）
+                new_sheet['H4'] = '=IF(E4>=3,"★",IF(AND(E4>=2,E4<3),"◐","☆"))'
+                
+                # I4: 4つ目の星（E4>=4なら★、E4>=3かつE4<4なら半分★、それ以外は☆）
+                new_sheet['I4'] = '=IF(E4>=4,"★",IF(AND(E4>=3,E4<4),"◐","☆"))'
+                
+                # J4: 5つ目の星（E4>=5なら★、E4>=4かつE4<5なら半分★、それ以外は☆）
+                new_sheet['J4'] = '=IF(E4>=5,"★",IF(AND(E4>=4,E4<5),"◐","☆"))'
+                
+                # フォントスタイルを設定して星を見やすくする
+                star_cells = ['F4', 'G4', 'H4', 'I4', 'J4']
+                try:
+                    for cell_ref in star_cells:
+                        cell = new_sheet[cell_ref]
+                        # 星の色を金色（FFD700）に設定し、サイズを大きく
+                        # 半分の星（◐）も同じスタイルで表示される
+                        cell.font = Font(name='Arial', size=16, color='FFD700', bold=True)
+                        cell.alignment = Alignment(horizontal='center', vertical='center')
+                except Exception:
+                    pass
+                
+                # 注意: ◐（左半分円）は星の形ではないため、視覚的に最適ではない可能性があります
+                # Excelで半分の星を正確に表示するには、条件付き書式のアイコンセットまたは
+                # カスタム図形を使用する方が良いですが、数式ベースの実装として◐を使用します
+                
+            except Exception as e:
+                print(f"星レビュー数式設定エラー: {str(e)}")
+                import traceback
+                traceback.print_exc()
+                pass
+                
+        except Exception:
+            pass
+
+        # レーダーチャートを作成（テーブルデータを基に）
+        try:
+            self.create_radar_chart(new_sheet, section_names, data_start_row=27, chart_position="B8")
+        except Exception as e:
+            # チャート作成に失敗しても処理を続行
+            print(f"チャート作成エラー: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            pass
+
+        # 必要ならコメント欄なども result から埋める
+        # 例: new_sheet['B35'] = result.get('comment', '')
+
         return new_sheet
     
     def create_summary_sheet(self, results, sections_data, points_data):
@@ -579,7 +719,7 @@ class ExcelReportGenerator:
             # 個別レポートシートを作成
             template_sheet_name = self.template_sheet.title
             for idx, result in enumerate(results, 3):  # 3行目から開始（ヘッダー行が2行目）
-                self.create_report_sheet(result, template_sheet_name, idx)
+                self.create_report_sheet(result, template_sheet_name, idx, all_results=results, sections_data=sections_data)
             
             # ファイルを保存
             if output_path:
